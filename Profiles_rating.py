@@ -1,14 +1,21 @@
 """
 rate_pairs_openrouter.py
 
-Sends each dating-profile pair to a model via OpenRouter as a completely
-fresh, isolated request — no shared conversation history, so pair N never
-has access to anything about pair N-1, N+1, or any other pair.
+Sends each dating-profile pair to a model via OpenRouter. Each pair's
+questionnaire .docx (Pair_XX_questionnaire.docx — intro, Male Profile,
+Female Profile, and all 13 questions, already combined) is read directly
+and its full text becomes the ONE single message sent to the model. No
+system prompt is used, and no part of the wording is hardcoded in this
+script — everything comes straight from the .docx files in
+QUESTIONNAIRES_DIR.
+
+Each pair still gets sent as a completely fresh API call (no message
+history carried over between pairs), and each response is parsed
+independently — a pair's result never depends on, or leaks into, any
+other pair's result.
 
 Requirements:
-    pip install openai python-dotenv --break-system-packages
-    (OpenRouter is OpenAI-API-compatible, so we just point the OpenAI SDK
-     at OpenRouter's base_url — no separate SDK needed.)
+    pip install openai python-dotenv python-docx --break-system-packages
 
 Usage:
     Create a .env file in this same directory containing:
@@ -16,16 +23,15 @@ Usage:
     Then just run:
         python rate_pairs_openrouter.py
 
-    (You can still use `export OPENROUTER_API_KEY=...` instead of a .env
-    file if you prefer — the script checks the environment either way.)
-
 Input:
-    profiles/pairXX_male.txt
-    profiles/pairXX_female.txt
-    (one pair of files per profile pair — only the 4 paragraphs, nothing else)
+    profiles/Pair_01_questionnaire.docx
+    profiles/Pair_02_questionnaire.docx
+    ...
+    (one fully-assembled questionnaire per pair — nothing else needed)
 
 Output:
-    results/pairXX_result.json   (raw response + parsed fields, per pair)
+    results/PairXX_result.json   (raw response + parsed fields, per pair)
+    results/PairXX_response.txt  (just the raw model response text)
     results/all_results.csv      (tidy summary table, one row per pair)
 """
 
@@ -36,6 +42,7 @@ import json
 import time
 from pathlib import Path
 
+import docx
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -49,79 +56,63 @@ load_dotenv()  # reads a .env file in the current directory into os.environ, if 
 # See https://openrouter.ai/models for the current list/slugs.
 MODEL = "openai/gpt-5.5"
 
-PROFILES_DIR = Path("profiles")
+QUESTIONNAIRES_DIR = Path("profiles")
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
-SYSTEM_PROMPT = """You will be presented with a pair of dating profiles selected from an online dating site. Evaluate the pair independently and base your judgments only on the information provided in the profiles below. Rate the pair on four compatibility dimensions followed by an overall compatibility assessment.
-
-Questions:
-
-1. How realistic do these two dating profiles appear? (1 = Not at all realistic, 7 = Highly realistic)
-
-2. Which of the following best describes how these profiles were constructed:
-   1. Written by LLMs without human input
-   2. Written by Humans without LLM assistance
-   3. Written through human-AI collaboration
-
-3. On a scale of 0-100 (0 = No compatibility, 100 = Perfect compatibility), rate the compatibility of the pair based on their social and demographic characteristics such as age, ethnicity, religion, education, height, body type, and other relevant background characteristics.
-
-4. How confident are you in your social and demographic rating? (0 = Not at all confident, 100 = Extremely confident)
-
-5. On a scale of 0-100 (0 = No compatibility, 100 = Perfect compatibility), rate the compatibility of the pair based on their psychological characteristics, personality, and interpersonal style.
-
-6. How confident are you in your psychological compatibility rating? (0 = Not at all confident, 100 = Extremely confident)?
-
-7. On a scale of 0-100 (0 = No compatibility, 100 = Perfect compatibility), rate the compatibility of the pair based on their hobbies, lifestyles, activities, and interests.
-
-8. How confident are you in your hobbies, lifestyle, and interests compatibility rating? (0 = Not at all confident, 100 = Extremely confident)?
-
-9. On a scale of 0-100 (0 = No compatibility, 100 = Perfect compatibility), rate the compatibility of the pair based on their expectations from their partner or relationship.
-
-10. How confident are you in your partner-expectation compatibility rating? (0 = Not at all confident, 100 = Extremely confident)
-
-11. Considering the profiles as a whole, on a scale of 0-100 (0 = No compatibility, 100 = Perfect compatibility), rate the overall compatibility of the pair?
-
-12. How confident are you in your overall compatibility rating? (0 = Not at all confident, 100 = Extremely confident)?
-
-13. List the five most important factors that influenced your overall compatibility rating, ordered from most important to least important. For each factor, briefly indicate whether it increased or decreased compatibility.
-
-Please return your responses in numbered order and provide one numeric value for each scale item."""
+# The title heading each generated questionnaire starts with, e.g.
+# "Profile Pair Compatibility Questionnaire — Pair 1". This is skipped
+# when building the prompt — it's a filing label for humans, not part of
+# the actual task text sent to the model.
+TITLE_HEADING_STYLE = "Heading 1"
 
 
-def discover_pairs():
-    """Find all pairXX_male.txt / pairXX_female.txt pairs in PROFILES_DIR."""
-    male_files = sorted(PROFILES_DIR.glob("pair*_male.txt"))
-    pair_ids = []
-    for mf in male_files:
-        pair_id = mf.stem.replace("_male", "")  # e.g. "pair01"
-        ff = PROFILES_DIR / f"{pair_id}_female.txt"
-        if ff.exists():
-            pair_ids.append(pair_id)
-        else:
-            print(f"WARNING: no matching female file for {mf}, skipping")
-    return pair_ids
+def extract_prompt_text(path):
+    """
+    Reads a Pair_XX_questionnaire.docx top to bottom and returns its full
+    body text (intro, Male Profile, Female Profile, all 13 questions) as
+    a single string, exactly as written in the document — skipping only
+    the title heading line. Nothing about the wording is duplicated or
+    hardcoded in this script.
+    """
+    d = docx.Document(path)
+    lines = []
+    for p in d.paragraphs:
+        text = p.text.strip()
+        if not text:
+            continue
+        style_name = p.style.name if p.style else ""
+        if style_name == TITLE_HEADING_STYLE:
+            continue
+        lines.append(text)
+    return "\n\n".join(lines)
 
 
-def rate_one_pair(client, male_text, female_text):
+def discover_questionnaires():
+    """Find every Pair_XX_questionnaire.docx in QUESTIONNAIRES_DIR (profiles/), in order."""
+    files = sorted(QUESTIONNAIRES_DIR.glob("Pair_*_questionnaire.docx"))
+    if not files:
+        raise SystemExit(
+            f"No questionnaire .docx files found in {QUESTIONNAIRES_DIR}/ "
+            "— check the folder name and that the files are there."
+        )
+    return files
+
+
+def rate_one_pair(client, prompt_text):
     """
     Makes a single, self-contained chat-completion call for one pair.
-    A brand-new `messages` list is built here every time — nothing is
-    carried over from previous calls, which is what guarantees isolation.
-    Each call also opens a fresh HTTP request; OpenRouter (like the
-    underlying providers) does not retain state between calls.
+    A brand-new `messages` list — containing exactly one user message —
+    is built here every time. Nothing is carried over from previous
+    calls, and no system message is used at all.
     """
-    user_content = f"Male Profile:\n{male_text}\n\nFemale Profile:\n{female_text}"
-
     response = client.chat.completions.create(
         model=MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},  # static, no profile content
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": prompt_text}
         ],
         max_tokens=1500,
     )
-
     return response.choices[0].message.content
 
 
@@ -151,22 +142,17 @@ def parse_numeric_fields(raw_text):
         fields[key] = m.group(1) if m else None
 
     # Question 13 is free text (five ranked factors), not a single number.
-    # Capture everything from "13." to the end of the response, then also
-    # split it into up to five separate factor lines for easier reading
-    # in the CSV.
     q13_match = re.search(r"13\.(.*)", raw_text, re.DOTALL)
     q13_block = q13_match.group(1).strip() if q13_match else ""
     fields["q13_factors_raw"] = q13_block.replace("\n", " | ")
 
-    # Best-effort split into individual factor lines. Numbered items
-    # (e.g. "1. ...", "2) ...") are matched directly so any preamble text
-    # before the first numbered item (like "Top five factors:") is
-    # discarded rather than counted as factor #1.
+    # Numbered items are matched directly so any preamble text before the
+    # first numbered item (like "Top five factors:") is discarded rather
+    # than counted as factor #1.
     factor_matches = re.findall(
         r"\d+[\.\)]\s*(.+?)(?=\n\s*\d+[\.\)]|\Z)", q13_block, re.DOTALL
     )
     if not factor_matches:
-        # Fall back to bullet points if the model didn't use numbers
         factor_matches = re.findall(r"[-•]\s*(.+?)(?=\n\s*[-•]|\Z)", q13_block, re.DOTALL)
     factor_lines = [f.strip().replace("\n", " ") for f in factor_matches if f.strip()]
     for i in range(5):
@@ -178,30 +164,33 @@ def parse_numeric_fields(raw_text):
 def main():
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        raise SystemExit("Set OPENROUTER_API_KEY before running.")
+        raise SystemExit("Set OPENROUTER_API_KEY (e.g. in a .env file) before running.")
 
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key,
-        # Optional but recommended by OpenRouter for routing/analytics attribution:
         default_headers={
             "HTTP-Referer": "https://your-site-or-project.example",  # replace or remove
             "X-Title": "Profile Pair Compatibility Rating",
         },
     )
 
-    pair_ids = discover_pairs()
-    print(f"Found {len(pair_ids)} pairs: {pair_ids}")
+    questionnaire_files = discover_questionnaires()
+    print(f"Found {len(questionnaire_files)} questionnaires: "
+          f"{[f.stem for f in questionnaire_files]}")
 
     csv_rows = []
 
-    for pair_id in pair_ids:
-        male_text = (PROFILES_DIR / f"{pair_id}_male.txt").read_text().strip()
-        female_text = (PROFILES_DIR / f"{pair_id}_female.txt").read_text().strip()
+    for qfile in questionnaire_files:
+        pair_id = qfile.stem.replace("_questionnaire", "")  # e.g. "Pair_01"
+
+        prompt_text = extract_prompt_text(qfile)
 
         print(f"Rating {pair_id} ...")
-        raw_text = rate_one_pair(client, male_text, female_text)
+        raw_text = rate_one_pair(client, prompt_text)
 
+        # Each pair's response is parsed on its own, independently of every
+        # other pair — nothing here references prior results.
         parsed = parse_numeric_fields(raw_text)
 
         result = {
@@ -218,7 +207,6 @@ def main():
 
         time.sleep(1)  # gentle pacing; adjust/remove based on your rate limits
 
-    # Tidy CSV summary
     if csv_rows:
         fieldnames = ["pair_id"] + [k for k in csv_rows[0].keys() if k != "pair_id"]
         with open(RESULTS_DIR / "all_results.csv", "w", newline="") as f:
