@@ -12,7 +12,8 @@ QUESTIONNAIRES_DIR.
 Each pair still gets sent as a completely fresh API call (no message
 history carried over between pairs), and each response is parsed
 independently — a pair's result never depends on, or leaks into, any
-other pair's result.
+other pair's result. This applies across temperatures too: every
+(pair, temperature) combination is its own isolated call.
 
 Requirements:
     pip install openai python-dotenv python-docx --break-system-packages
@@ -23,16 +24,23 @@ Usage:
     Then just run:
         python rate_pairs_openrouter.py
 
+    Every pair is rated once per temperature in TEMPERATURES (near the
+    top of this file) — by default: 0.2, the model's own default
+    (temperature omitted), and 0.7.
+
 Input:
     profiles/Pair_01_questionnaire.docx
     profiles/Pair_02_questionnaire.docx
     ...
     (one fully-assembled questionnaire per pair — nothing else needed)
 
-Output:
-    results/PairXX_result.json   (raw response + parsed fields, per pair)
-    results/PairXX_response.txt  (just the raw model response text)
-    results/all_results.csv      (tidy summary table, one row per pair)
+Output (per temperature, under results/temp_<value>/ or results/temp_default/):
+    PairXX_result.json   (raw response + parsed fields, per pair)
+    PairXX_response.txt  (just the raw model response text)
+    all_results.csv      (that temperature's results, one row per pair)
+
+Also written directly under results/:
+    all_results_all_temperatures.csv   (every pair x every temperature, combined)
 """
 
 import os
@@ -59,6 +67,11 @@ MODEL = "openai/gpt-5.5"
 QUESTIONNAIRES_DIR = Path("profiles")
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
+
+# Each pair is rated once per temperature listed here. Use None for
+# "don't set temperature at all" (the API's own default), and a float
+# for an explicit value.
+TEMPERATURES = [0.2, None, 0.7]
 
 # The title heading each generated questionnaire starts with, e.g.
 # "Profile Pair Compatibility Questionnaire — Pair 1". This is skipped
@@ -99,20 +112,28 @@ def discover_questionnaires():
     return files
 
 
-def rate_one_pair(client, prompt_text):
+def rate_one_pair(client, prompt_text, temperature=None):
     """
-    Makes a single, self-contained chat-completion call for one pair.
-    A brand-new `messages` list — containing exactly one user message —
-    is built here every time. Nothing is carried over from previous
-    calls, and no system message is used at all.
+    Makes a single, self-contained chat-completion call for one pair at
+    one temperature. A brand-new `messages` list — containing exactly
+    one user message — is built here every time. Nothing is carried
+    over from previous calls (across pairs OR across temperatures), and
+    no system message is used at all.
+
+    temperature=None means the parameter is omitted entirely, so the
+    API/model's own default temperature is used.
     """
-    response = client.chat.completions.create(
+    kwargs = dict(
         model=MODEL,
         messages=[
             {"role": "user", "content": prompt_text}
         ],
         max_tokens=1500,
     )
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+
+    response = client.chat.completions.create(**kwargs)
     return response.choices[0].message.content
 
 
@@ -161,6 +182,11 @@ def parse_numeric_fields(raw_text):
     return fields
 
 
+def temp_label(temperature):
+    """Filesystem-friendly label for a temperature value, e.g. 0.2 -> 'temp_0.2', None -> 'temp_default'."""
+    return f"temp_{temperature}" if temperature is not None else "temp_default"
+
+
 def main():
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
@@ -178,43 +204,69 @@ def main():
     questionnaire_files = discover_questionnaires()
     print(f"Found {len(questionnaire_files)} questionnaires: "
           f"{[f.stem for f in questionnaire_files]}")
+    print(f"Running at temperatures: {TEMPERATURES}")
 
-    csv_rows = []
+    combined_rows = []  # every pair x every temperature, for one all-up CSV
 
-    for qfile in questionnaire_files:
-        pair_id = qfile.stem.replace("_questionnaire", "")  # e.g. "Pair_01"
+    for temperature in TEMPERATURES:
+        label = temp_label(temperature)
+        temp_dir = RESULTS_DIR / label
+        temp_dir.mkdir(parents=True, exist_ok=True)
 
-        prompt_text = extract_prompt_text(qfile)
+        print(f"\n=== Temperature: {temperature if temperature is not None else 'default'} ===")
 
-        print(f"Rating {pair_id} ...")
-        raw_text = rate_one_pair(client, prompt_text)
+        csv_rows = []
 
-        # Each pair's response is parsed on its own, independently of every
-        # other pair — nothing here references prior results.
-        parsed = parse_numeric_fields(raw_text)
+        for qfile in questionnaire_files:
+            pair_id = qfile.stem.replace("_questionnaire", "")  # e.g. "Pair_01"
 
-        result = {
-            "pair_id": pair_id,
-            "model": MODEL,
-            "raw_response": raw_text,
-            "parsed": parsed,
-        }
-        (RESULTS_DIR / f"{pair_id}_result.json").write_text(json.dumps(result, indent=2))
-        (RESULTS_DIR / f"{pair_id}_response.txt").write_text(raw_text)
+            prompt_text = extract_prompt_text(qfile)
 
-        row = {"pair_id": pair_id, **parsed}
-        csv_rows.append(row)
+            print(f"Rating {pair_id} ({label}) ...")
+            # Fresh, isolated call every time: new pair, new temperature,
+            # new messages list — nothing carried over from any other
+            # call, at this temperature or any other.
+            raw_text = rate_one_pair(client, prompt_text, temperature=temperature)
 
-        time.sleep(1)  # gentle pacing; adjust/remove based on your rate limits
+            parsed = parse_numeric_fields(raw_text)
 
-    if csv_rows:
-        fieldnames = ["pair_id"] + [k for k in csv_rows[0].keys() if k != "pair_id"]
-        with open(RESULTS_DIR / "all_results.csv", "w", newline="") as f:
+            result = {
+                "pair_id": pair_id,
+                "model": MODEL,
+                "temperature": temperature,
+                "raw_response": raw_text,
+                "parsed": parsed,
+            }
+            (temp_dir / f"{pair_id}_result.json").write_text(json.dumps(result, indent=2))
+            (temp_dir / f"{pair_id}_response.txt").write_text(raw_text)
+
+            row = {"pair_id": pair_id, "temperature": temperature, **parsed}
+            csv_rows.append(row)
+            combined_rows.append(row)
+
+            time.sleep(1)  # gentle pacing; adjust/remove based on your rate limits
+
+        if csv_rows:
+            fieldnames = ["pair_id", "temperature"] + [
+                k for k in csv_rows[0].keys() if k not in ("pair_id", "temperature")
+            ]
+            with open(temp_dir / "all_results.csv", "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(csv_rows)
+
+    # One combined CSV across all temperatures, for easy side-by-side comparison
+    if combined_rows:
+        fieldnames = ["pair_id", "temperature"] + [
+            k for k in combined_rows[0].keys() if k not in ("pair_id", "temperature")
+        ]
+        with open(RESULTS_DIR / "all_results_all_temperatures.csv", "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(csv_rows)
+            writer.writerows(combined_rows)
 
-    print(f"\nDone. Results saved to {RESULTS_DIR}/")
+    print(f"\nDone. Results saved under {RESULTS_DIR}/ "
+          f"(one subfolder per temperature, plus all_results_all_temperatures.csv)")
 
 
 if __name__ == "__main__":
