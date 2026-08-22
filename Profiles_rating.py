@@ -1,22 +1,26 @@
 """
 rate_pairs_openrouter.py
 
-Sends each dating-profile pair to a model via OpenRouter. Each pair's
-questionnaire .docx (Pair_XX_questionnaire.docx — intro, Male Profile,
-Female Profile, and all 13 questions, already combined) is read directly
-and its full text becomes the ONE single message sent to the model. No
-system prompt is used, and no part of the wording is hardcoded in this
-script — everything comes straight from the .docx files in
-QUESTIONNAIRES_DIR.
+Sends each dating-profile pair to one or more models via OpenRouter, at
+whatever temperature the model is actually configured with (no explicit
+temperature override — see TEMPERATURE below). Each pair's questionnaire
+.docx (Pair_XX_questionnaire.docx — intro, Male Profile, Female Profile,
+and all 13 questions, already combined) is read directly and its full
+text becomes the ONE single message sent to the model. No system prompt
+is used, and no part of the wording is hardcoded in this script —
+everything comes straight from the .docx files in QUESTIONNAIRES_DIR.
 
-Each pair still gets sent as a completely fresh API call (no message
-history carried over between pairs), and each response is parsed
-independently — a pair's result never depends on, or leaks into, any
-other pair's result. This applies across temperatures too: every
-(pair, temperature) combination is its own isolated call.
+Every pair is rated once per model in MODELS — so total calls =
+len(MODELS) x number of pairs. Each call is completely fresh and
+isolated: a brand-new `messages` list with no history carried over from
+any other pair or model, and each response is parsed independently.
+
+Results (the 12 numeric scores plus the 5 ranked factors from question
+13) are written directly into spreadsheets — one per model, saved in a
+results/ folder — no per-pair .json or .txt files are created.
 
 Requirements:
-    pip install openai python-dotenv python-docx --break-system-packages
+    pip install openai python-dotenv python-docx openpyxl --break-system-packages
 
 Usage:
     Create a .env file in this same directory containing:
@@ -24,9 +28,7 @@ Usage:
     Then just run:
         python rate_pairs_openrouter.py
 
-    Every pair is rated once per temperature in TEMPERATURES (near the
-    top of this file) — by default: 0.2, the model's own default
-    (temperature omitted), and 0.7.
+    Edit MODELS near the top of this file to control which model(s) run.
 
 Input:
     profiles/Pair_01_questionnaire.docx
@@ -34,44 +36,46 @@ Input:
     ...
     (one fully-assembled questionnaire per pair — nothing else needed)
 
-Output (per temperature, under results/temp_<value>/ or results/temp_default/):
-    PairXX_result.json   (raw response + parsed fields, per pair)
-    PairXX_response.txt  (just the raw model response text)
-    all_results.csv      (that temperature's results, one row per pair)
-
-Also written directly under results/:
-    all_results_all_temperatures.csv   (every pair x every temperature, combined)
+Output:
+    results/<model>_results.xlsx   (one file per model, one row per pair)
 """
 
 import os
 import re
-import csv
-import json
 import time
 from pathlib import Path
 
 import docx
 from dotenv import load_dotenv
 from openai import OpenAI
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 load_dotenv()  # reads a .env file in the current directory into os.environ, if present
 
 # --- Model selection -------------------------------------------------------
 # Any OpenRouter model slug works here, e.g.:
 #   "openai/gpt-5.5"
-#   "anthropic/claude-sonnet-4.5"
+#   "anthropic/claude-opus-4.8"
 #   "google/gemini-2.5-pro"
 # See https://openrouter.ai/models for the current list/slugs.
-MODEL = "openai/gpt-5.5"
+# Every pair is rated once per model listed here.
+MODELS = [
+    "openai/gpt-5.5",
+    "anthropic/claude-opus-4.8",
+    "google/gemini-2.5-pro",
+]
+
+# Temperature is intentionally NOT set on the API call — this leaves each
+# model at whatever temperature it's actually configured with by default
+# on OpenRouter. Set this to a float instead if you want one fixed
+# temperature applied to every call.
+TEMPERATURE = None
 
 QUESTIONNAIRES_DIR = Path("profiles")
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
-
-# Each pair is rated once per temperature listed here. Use None for
-# "don't set temperature at all" (the API's own default), and a float
-# for an explicit value.
-TEMPERATURES = [0.2, None, 0.7]
 
 # The title heading each generated questionnaire starts with, e.g.
 # "Profile Pair Compatibility Questionnaire — Pair 1". This is skipped
@@ -112,26 +116,23 @@ def discover_questionnaires():
     return files
 
 
-def rate_one_pair(client, prompt_text, temperature=None):
+def rate_one_pair(client, prompt_text, model):
     """
-    Makes a single, self-contained chat-completion call for one pair at
-    one temperature. A brand-new `messages` list — containing exactly
-    one user message — is built here every time. Nothing is carried
-    over from previous calls (across pairs OR across temperatures), and
-    no system message is used at all.
-
-    temperature=None means the parameter is omitted entirely, so the
-    API/model's own default temperature is used.
+    Makes a single, self-contained chat-completion call for one pair, at
+    one model. A brand-new `messages` list — containing exactly one user
+    message — is built here every time. Nothing is carried over from
+    previous calls (across pairs OR models), and no system message is
+    used at all.
     """
     kwargs = dict(
-        model=MODEL,
+        model=model,
         messages=[
             {"role": "user", "content": prompt_text}
         ],
         max_tokens=1500,
     )
-    if temperature is not None:
-        kwargs["temperature"] = temperature
+    if TEMPERATURE is not None:
+        kwargs["temperature"] = TEMPERATURE
 
     response = client.chat.completions.create(**kwargs)
     return response.choices[0].message.content
@@ -141,7 +142,8 @@ def parse_numeric_fields(raw_text):
     """
     Best-effort parse of the numbered answers into a flat dict.
     Falls back to leaving fields blank if the model's formatting varies —
-    the raw text is always saved too, so nothing is lost.
+    the raw response text is included in the return value too, so
+    nothing is lost even if a field fails to parse.
     """
     fields = {}
     patterns = {
@@ -165,7 +167,6 @@ def parse_numeric_fields(raw_text):
     # Question 13 is free text (five ranked factors), not a single number.
     q13_match = re.search(r"13\.(.*)", raw_text, re.DOTALL)
     q13_block = q13_match.group(1).strip() if q13_match else ""
-    fields["q13_factors_raw"] = q13_block.replace("\n", " | ")
 
     # Numbered items are matched directly so any preamble text before the
     # first numbered item (like "Top five factors:") is discarded rather
@@ -179,12 +180,101 @@ def parse_numeric_fields(raw_text):
     for i in range(5):
         fields[f"q13_factor_{i+1}"] = factor_lines[i] if i < len(factor_lines) else None
 
+    fields["raw_response"] = raw_text
     return fields
 
 
-def temp_label(temperature):
-    """Filesystem-friendly label for a temperature value, e.g. 0.2 -> 'temp_0.2', None -> 'temp_default'."""
-    return f"temp_{temperature}" if temperature is not None else "temp_default"
+# Column layout for the output spreadsheet: (header label, field key)
+# No "Model" column — each spreadsheet is already scoped to one model.
+COLUMNS = [
+    ("Pair", "pair_id"),
+    ("Q1 Realism (1-7)", "q1_realism"),
+    ("Q2 Construction (1-3)", "q2_construction"),
+    ("Q3 Social/Demo Compat", "q3_social_demo"),
+    ("Q4 Social/Demo Conf.", "q4_social_demo_conf"),
+    ("Q5 Psych Compat", "q5_psych"),
+    ("Q6 Psych Conf.", "q6_psych_conf"),
+    ("Q7 Hobbies Compat", "q7_hobbies"),
+    ("Q8 Hobbies Conf.", "q8_hobbies_conf"),
+    ("Q9 Expectations Compat", "q9_expectations"),
+    ("Q10 Expectations Conf.", "q10_expectations_conf"),
+    ("Q11 Overall Compat", "q11_overall"),
+    ("Q12 Overall Conf.", "q12_overall_conf"),
+    ("Q13 Factor 1", "q13_factor_1"),
+    ("Q13 Factor 2", "q13_factor_2"),
+    ("Q13 Factor 3", "q13_factor_3"),
+    ("Q13 Factor 4", "q13_factor_4"),
+    ("Q13 Factor 5", "q13_factor_5"),
+]
+
+
+def model_filename(model):
+    """
+    Turns an OpenRouter model slug into a filesystem-safe filename, e.g.
+    'openai/gpt-5.5' -> 'openai_gpt-5.5_results.xlsx'.
+    """
+    safe = model.replace("/", "_")
+    return f"{safe}_results.xlsx"
+
+
+def build_workbook(rows):
+    """
+    Builds a formatted spreadsheet from the collected rows — one row per
+    (pair, model) combination, all scores and factors as columns.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Results"
+
+    FONT = "Arial"
+    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    header_font = Font(name=FONT, bold=True, color="FFFFFF", size=10)
+    cell_font = Font(name=FONT, size=10)
+    pair_font = Font(name=FONT, bold=True, size=10)
+    thin = Side(style="thin", color="B7B7B7")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    wrap = Alignment(wrap_text=True, vertical="top")
+
+    for c, (label, _) in enumerate(COLUMNS, start=1):
+        cell = ws.cell(row=1, column=c, value=label)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+    ws.row_dimensions[1].height = 30
+
+    for r, row in enumerate(rows, start=2):
+        for c, (_, key) in enumerate(COLUMNS, start=1):
+            val = row.get(key)
+            cell = ws.cell(row=r, column=c, value=val)
+            cell.border = border
+            if key == "pair_id":
+                cell.font = pair_font
+                cell.alignment = center
+            elif key.startswith("q13_factor"):
+                cell.font = cell_font
+                cell.alignment = wrap
+            else:
+                cell.font = cell_font
+                cell.alignment = center
+
+    ws.column_dimensions["A"].width = 10
+    for c in range(2, 14):
+        ws.column_dimensions[get_column_letter(c)].width = 13
+    for c in range(14, 19):
+        ws.column_dimensions[get_column_letter(c)].width = 34
+
+    ws.freeze_panes = "B2"
+
+    # Print setup: fit to page width, landscape, repeat header row
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_title_rows = "1:1"
+
+    return wb
 
 
 def main():
@@ -204,69 +294,38 @@ def main():
     questionnaire_files = discover_questionnaires()
     print(f"Found {len(questionnaire_files)} questionnaires: "
           f"{[f.stem for f in questionnaire_files]}")
-    print(f"Running at temperatures: {TEMPERATURES}")
+    print(f"Running models: {MODELS}")
+    total_calls = len(MODELS) * len(questionnaire_files)
+    print(f"Total API calls this run: {total_calls}")
 
-    combined_rows = []  # every pair x every temperature, for one all-up CSV
+    for model in MODELS:
+        print(f"\n=== Model: {model} ===")
 
-    for temperature in TEMPERATURES:
-        label = temp_label(temperature)
-        temp_dir = RESULTS_DIR / label
-        temp_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"\n=== Temperature: {temperature if temperature is not None else 'default'} ===")
-
-        csv_rows = []
+        rows = []
 
         for qfile in questionnaire_files:
             pair_id = qfile.stem.replace("_questionnaire", "")  # e.g. "Pair_01"
 
             prompt_text = extract_prompt_text(qfile)
 
-            print(f"Rating {pair_id} ({label}) ...")
-            # Fresh, isolated call every time: new pair, new temperature,
-            # new messages list — nothing carried over from any other
-            # call, at this temperature or any other.
-            raw_text = rate_one_pair(client, prompt_text, temperature=temperature)
+            print(f"Rating {pair_id} ({model}) ...")
+            # Fresh, isolated call every time: new pair, new model, new
+            # messages list — nothing carried over from any other call.
+            raw_text = rate_one_pair(client, prompt_text, model=model)
 
             parsed = parse_numeric_fields(raw_text)
 
-            result = {
-                "pair_id": pair_id,
-                "model": MODEL,
-                "temperature": temperature,
-                "raw_response": raw_text,
-                "parsed": parsed,
-            }
-            (temp_dir / f"{pair_id}_result.json").write_text(json.dumps(result, indent=2))
-            (temp_dir / f"{pair_id}_response.txt").write_text(raw_text)
-
-            row = {"pair_id": pair_id, "temperature": temperature, **parsed}
-            csv_rows.append(row)
-            combined_rows.append(row)
+            row = {"pair_id": pair_id, **parsed}
+            rows.append(row)
 
             time.sleep(1)  # gentle pacing; adjust/remove based on your rate limits
 
-        if csv_rows:
-            fieldnames = ["pair_id", "temperature"] + [
-                k for k in csv_rows[0].keys() if k not in ("pair_id", "temperature")
-            ]
-            with open(temp_dir / "all_results.csv", "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(csv_rows)
+        wb = build_workbook(rows)
+        out_path = RESULTS_DIR / model_filename(model)
+        wb.save(out_path)
+        print(f"Saved {len(rows)} rows to {out_path}")
 
-    # One combined CSV across all temperatures, for easy side-by-side comparison
-    if combined_rows:
-        fieldnames = ["pair_id", "temperature"] + [
-            k for k in combined_rows[0].keys() if k not in ("pair_id", "temperature")
-        ]
-        with open(RESULTS_DIR / "all_results_all_temperatures.csv", "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(combined_rows)
-
-    print(f"\nDone. Results saved under {RESULTS_DIR}/ "
-          f"(one subfolder per temperature, plus all_results_all_temperatures.csv)")
+    print(f"\nDone. One spreadsheet per model saved under {RESULTS_DIR}/")
 
 
 if __name__ == "__main__":
