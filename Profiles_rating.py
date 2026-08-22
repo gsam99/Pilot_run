@@ -47,7 +47,7 @@ from pathlib import Path
 
 import docx
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APITimeoutError, InternalServerError
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -58,13 +58,12 @@ load_dotenv()  # reads a .env file in the current directory into os.environ, if 
 # Any OpenRouter model slug works here, e.g.:
 #   "openai/gpt-5.5"
 #   "anthropic/claude-opus-4.8"
-#   "google/gemini-2.5-pro"
+#   "google/gemini-3.7-flash"
 # See https://openrouter.ai/models for the current list/slugs.
-# Every pair is rated once per model listed here.
+# Every pair is rated once per model listed here — edit this list directly
+# to add, remove, or swap which models run.
 MODELS = [
-    "openai/gpt-5.5",
-    "anthropic/claude-opus-4.8",
-    "google/gemini-2.5-pro",
+    "openai/gpt-5.5"
 ]
 
 # Temperature is intentionally NOT set on the API call — this leaves each
@@ -72,6 +71,13 @@ MODELS = [
 # on OpenRouter. Set this to a float instead if you want one fixed
 # temperature applied to every call.
 TEMPERATURE = None
+
+# Transient network/connection errors are retried automatically (things
+# like a dropped SSL connection, a timeout, or the provider being briefly
+# unavailable) — this many attempts per (pair, model) call before giving
+# up and moving on, so one flaky connection doesn't crash the whole run.
+MAX_RETRIES = 4
+RETRY_BACKOFF_SECONDS = 5  # doubles after each retry: 5s, 10s, 20s, ...
 
 QUESTIONNAIRES_DIR = Path("profiles")
 RESULTS_DIR = Path("results")
@@ -123,6 +129,12 @@ def rate_one_pair(client, prompt_text, model):
     message — is built here every time. Nothing is carried over from
     previous calls (across pairs OR models), and no system message is
     used at all.
+
+    Transient network errors (dropped connections, timeouts, brief
+    provider outages) are retried automatically up to MAX_RETRIES times
+    with increasing delay between attempts. Other errors (bad API key,
+    invalid model name, etc.) are NOT retried — they're raised
+    immediately since retrying won't fix them.
     """
     kwargs = dict(
         model=model,
@@ -134,8 +146,22 @@ def rate_one_pair(client, prompt_text, model):
     if TEMPERATURE is not None:
         kwargs["temperature"] = TEMPERATURE
 
-    response = client.chat.completions.create(**kwargs)
-    return response.choices[0].message.content
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(**kwargs)
+            return response.choices[0].message.content
+        except (APIConnectionError, APITimeoutError, InternalServerError) as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                print(f"  Network error ({type(e).__name__}), "
+                      f"retrying in {wait}s (attempt {attempt}/{MAX_RETRIES}) ...")
+                time.sleep(wait)
+            else:
+                print(f"  Giving up after {MAX_RETRIES} attempts: {e}")
+
+    raise last_error
 
 
 def parse_numeric_fields(raw_text):
@@ -148,7 +174,6 @@ def parse_numeric_fields(raw_text):
     fields = {}
     patterns = {
         "q1_realism": r"1\.\s*.*?([1-7])\b",
-        "q2_construction": r"2\..*?\n?\s*([1-3])\b",
         "q3_social_demo": r"3\..*?(\d{1,3})\b",
         "q4_social_demo_conf": r"4\..*?(\d{1,3})\b",
         "q5_psych": r"5\..*?(\d{1,3})\b",
@@ -164,9 +189,37 @@ def parse_numeric_fields(raw_text):
         m = re.search(pat, raw_text, re.DOTALL)
         fields[key] = m.group(1) if m else None
 
-    # Question 13 is free text (five ranked factors), not a single number.
+    # Q2's answer format changed (options are now lettered a/b/c instead of
+    # numbered 1/2/3), and models phrase the answer inconsistently — so
+    # this is parsed separately, searching only within the bounded block
+    # of text between "2." and "3." (never spilling into later questions,
+    # which is what caused a real bug: an unbounded search here used to
+    # grab a stray digit from question 3's answer instead).
+    q2_block_match = re.search(r"2\.(.*?)(?=\n\s*3\.)", raw_text, re.DOTALL)
+    if q2_block_match:
+        q2_block = q2_block_match.group(1)
+        m = re.search(r"\b([1-3]|[a-cA-C])\b", q2_block)
+        fields["q2_construction"] = m.group(1) if m else None
+    else:
+        fields["q2_construction"] = None
+
+    # Question 13 is free text: up to 6 ranked factors (a 6th "Other"
+    # bucket is allowed), each with a direction (increased/decreased)
+    # and a points value that should sum to 100 across all factors.
     q13_match = re.search(r"13\.(.*)", raw_text, re.DOTALL)
     q13_block = q13_match.group(1).strip() if q13_match else ""
+
+    # Models often add a trailing summary after the numbered list (a
+    # "Total: 100 points" line, a "---" divider, a closing note). None of
+    # that belongs to the last factor, so it's cut off here before the
+    # list is split into individual factors — otherwise it all gets
+    # glued onto factor 5/6's text.
+    trailer_match = re.search(
+        r"\n\s*(?:\*{0,2}Total\b|-{3,}|\*Summary\b|Summary note)",
+        q13_block, re.IGNORECASE
+    )
+    if trailer_match:
+        q13_block = q13_block[:trailer_match.start()]
 
     # Numbered items are matched directly so any preamble text before the
     # first numbered item (like "Top five factors:") is discarded rather
@@ -177,8 +230,50 @@ def parse_numeric_fields(raw_text):
     if not factor_matches:
         factor_matches = re.findall(r"[-•]\s*(.+?)(?=\n\s*[-•]|\Z)", q13_block, re.DOTALL)
     factor_lines = [f.strip().replace("\n", " ") for f in factor_matches if f.strip()]
-    for i in range(5):
-        fields[f"q13_factor_{i+1}"] = factor_lines[i] if i < len(factor_lines) else None
+
+    def extract_points(factor_text):
+        """
+        Pulls the points value out of a factor's text, trying a few
+        common ways a model might phrase it before falling back to the
+        last standalone number in the text. Returns None if nothing
+        number-like is found at all.
+        """
+        m = re.search(r"(\d{1,3})\s*(?:points?|pts?)\b", factor_text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        m = re.search(r"\((\d{1,3})\)\s*$", factor_text)
+        if m:
+            return m.group(1)
+        m = re.search(r"(\d{1,3})(?!.*\d)", factor_text)
+        return m.group(1) if m else None
+
+    def clean_factor_description(factor_text):
+        """
+        Strips the points phrase (e.g. "— 35 points", "(35 pts)") and
+        markdown bold markers out of the factor text, since the number
+        already lives in its own column — this keeps the description
+        column pure prose instead of duplicating "35 points" inline.
+        """
+        # Remove a "<dash/em-dash> NN points" or "(NN points)" chunk
+        text = re.sub(
+            r"\s*[-—–]\s*\d{1,3}\s*(?:points?|pts?)\b",
+            "", factor_text, flags=re.IGNORECASE
+        )
+        text = re.sub(
+            r"\s*\(\d{1,3}\s*(?:points?|pts?)?\)\s*",
+            " ", text, flags=re.IGNORECASE
+        )
+        # Strip markdown bold/italic markers
+        text = text.replace("**", "").replace("*", "")
+        return text.strip(" -—–\u2014\u2013")
+
+    for i in range(6):  # up to 5 factors + optional 6th "Other" bucket
+        if i < len(factor_lines):
+            fields[f"q13_factor_{i+1}"] = clean_factor_description(factor_lines[i])
+            fields[f"q13_factor_{i+1}_points"] = extract_points(factor_lines[i])
+        else:
+            fields[f"q13_factor_{i+1}"] = None
+            fields[f"q13_factor_{i+1}_points"] = None
 
     fields["raw_response"] = raw_text
     return fields
@@ -186,6 +281,10 @@ def parse_numeric_fields(raw_text):
 
 # Column layout for the output spreadsheet: (header label, field key)
 # No "Model" column — each spreadsheet is already scoped to one model.
+# Each Q13 factor gets its own column, immediately followed by a column
+# for that factor's points value, so the two sit side by side and are
+# easy to scan (and to sum/chart) separately from the free-text factor
+# description itself.
 COLUMNS = [
     ("Pair", "pair_id"),
     ("Q1 Realism (1-7)", "q1_realism"),
@@ -201,10 +300,17 @@ COLUMNS = [
     ("Q11 Overall Compat", "q11_overall"),
     ("Q12 Overall Conf.", "q12_overall_conf"),
     ("Q13 Factor 1", "q13_factor_1"),
+    ("Q13 Factor 1 Points", "q13_factor_1_points"),
     ("Q13 Factor 2", "q13_factor_2"),
+    ("Q13 Factor 2 Points", "q13_factor_2_points"),
     ("Q13 Factor 3", "q13_factor_3"),
+    ("Q13 Factor 3 Points", "q13_factor_3_points"),
     ("Q13 Factor 4", "q13_factor_4"),
+    ("Q13 Factor 4 Points", "q13_factor_4_points"),
     ("Q13 Factor 5", "q13_factor_5"),
+    ("Q13 Factor 5 Points", "q13_factor_5_points"),
+    ("Q13 Factor 6 (Other)", "q13_factor_6"),
+    ("Q13 Factor 6 Points", "q13_factor_6_points"),
 ]
 
 
@@ -252,6 +358,9 @@ def build_workbook(rows):
             if key == "pair_id":
                 cell.font = pair_font
                 cell.alignment = center
+            elif key.startswith("q13_factor") and key.endswith("_points"):
+                cell.font = cell_font
+                cell.alignment = center
             elif key.startswith("q13_factor"):
                 cell.font = cell_font
                 cell.alignment = wrap
@@ -260,10 +369,16 @@ def build_workbook(rows):
                 cell.alignment = center
 
     ws.column_dimensions["A"].width = 10
-    for c in range(2, 14):
-        ws.column_dimensions[get_column_letter(c)].width = 13
-    for c in range(14, 19):
-        ws.column_dimensions[get_column_letter(c)].width = 34
+    for c, (_, key) in enumerate(COLUMNS, start=1):
+        if key == "pair_id":
+            continue
+        col_letter = get_column_letter(c)
+        if key.startswith("q13_factor") and key.endswith("_points"):
+            ws.column_dimensions[col_letter].width = 12
+        elif key.startswith("q13_factor"):
+            ws.column_dimensions[col_letter].width = 32
+        else:
+            ws.column_dimensions[col_letter].width = 13
 
     ws.freeze_panes = "B2"
 
@@ -294,6 +409,7 @@ def main():
     questionnaire_files = discover_questionnaires()
     print(f"Found {len(questionnaire_files)} questionnaires: "
           f"{[f.stem for f in questionnaire_files]}")
+
     print(f"Running models: {MODELS}")
     total_calls = len(MODELS) * len(questionnaire_files)
     print(f"Total API calls this run: {total_calls}")
@@ -302,6 +418,7 @@ def main():
         print(f"\n=== Model: {model} ===")
 
         rows = []
+        out_path = RESULTS_DIR / model_filename(model)
 
         for qfile in questionnaire_files:
             pair_id = qfile.stem.replace("_questionnaire", "")  # e.g. "Pair_01"
@@ -309,20 +426,31 @@ def main():
             prompt_text = extract_prompt_text(qfile)
 
             print(f"Rating {pair_id} ({model}) ...")
-            # Fresh, isolated call every time: new pair, new model, new
-            # messages list — nothing carried over from any other call.
-            raw_text = rate_one_pair(client, prompt_text, model=model)
+            try:
+                # Fresh, isolated call every time: new pair, new model, new
+                # messages list — nothing carried over from any other call.
+                raw_text = rate_one_pair(client, prompt_text, model=model)
+                parsed = parse_numeric_fields(raw_text)
+                row = {"pair_id": pair_id, **parsed}
+            except Exception as e:
+                # After MAX_RETRIES failed attempts (or a non-retryable
+                # error), don't crash the whole run — record the failure
+                # for this pair and move on to the next one. You can spot
+                # these afterward: every score column will be blank and
+                # q13_factor_1 will contain the error message.
+                print(f"  FAILED for {pair_id} after retries: {e}")
+                row = {"pair_id": pair_id, "q13_factor_1": f"ERROR: {e}"}
 
-            parsed = parse_numeric_fields(raw_text)
-
-            row = {"pair_id": pair_id, **parsed}
             rows.append(row)
+
+            # Save after every pair, not just at the end of the model —
+            # so if the run is interrupted, everything done so far for
+            # this model is already on disk.
+            wb = build_workbook(rows)
+            wb.save(out_path)
 
             time.sleep(1)  # gentle pacing; adjust/remove based on your rate limits
 
-        wb = build_workbook(rows)
-        out_path = RESULTS_DIR / model_filename(model)
-        wb.save(out_path)
         print(f"Saved {len(rows)} rows to {out_path}")
 
     print(f"\nDone. One spreadsheet per model saved under {RESULTS_DIR}/")
