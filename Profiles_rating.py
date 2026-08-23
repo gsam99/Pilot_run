@@ -63,7 +63,7 @@ load_dotenv()  # reads a .env file in the current directory into os.environ, if 
 # Every pair is rated once per model listed here — edit this list directly
 # to add, remove, or swap which models run.
 MODELS = [
-    "openai/gpt-5.5"
+    "z-ai/glm-5.3"
 ]
 
 # Temperature is intentionally NOT set on the API call — this leaves each
@@ -71,6 +71,24 @@ MODELS = [
 # on OpenRouter. Set this to a float instead if you want one fixed
 # temperature applied to every call.
 TEMPERATURE = None
+
+# Maximum length of the model's response. If a model writes a lot of
+# explanatory reasoning (especially for low-compatibility pairs, where
+# models tend to over-explain), a low limit here can cut the response off
+# before it reaches later questions — those then show up as blank in the
+# spreadsheet even though nothing went wrong with parsing. This is the
+# STARTING budget for every call; see MAX_TOKENS_CEILING below for what
+# happens if even this isn't enough for a particular pair.
+MAX_TOKENS = 4000
+
+# If a response comes back truncated (the model hit MAX_TOKENS before
+# finishing), that specific call is automatically retried with a bigger
+# budget — doubling each time — rather than requiring you to guess the
+# right fixed number for every possible pair up front. This is the hard
+# ceiling on that doubling: 4000 -> 8000 -> 16000, then stop. Raise this
+# if you have pairs that are still truncating even at 16000 tokens
+# (unusual for this questionnaire, but possible with a very verbose model).
+MAX_TOKENS_CEILING = 16000
 
 # Transient network/connection errors are retried automatically (things
 # like a dropped SSL connection, a timeout, or the provider being briefly
@@ -130,84 +148,174 @@ def rate_one_pair(client, prompt_text, model):
     previous calls (across pairs OR models), and no system message is
     used at all.
 
-    Transient network errors (dropped connections, timeouts, brief
-    provider outages) are retried automatically up to MAX_RETRIES times
-    with increasing delay between attempts. Other errors (bad API key,
-    invalid model name, etc.) are NOT retried — they're raised
-    immediately since retrying won't fix them.
+    Two independent failure modes are handled automatically:
+
+    1. Transient network errors (dropped connections, timeouts, brief
+       provider outages) are retried up to MAX_RETRIES times with
+       increasing delay between attempts. Other errors (bad API key,
+       invalid model name, etc.) are NOT retried — they're raised
+       immediately since retrying won't fix them.
+
+    2. Truncated responses (the model hit the token limit before
+       finishing) are retried with a DOUBLED token budget, up to
+       MAX_TOKENS_CEILING. This means you don't have to guess the right
+       fixed MAX_TOKENS for every pair — a normally-short pair still
+       uses the small starting budget, while a pair that genuinely needs
+       more room gets it automatically, on that same pair's call only.
     """
-    kwargs = dict(
-        model=model,
-        messages=[
-            {"role": "user", "content": prompt_text}
-        ],
-        max_tokens=1500,
-    )
-    if TEMPERATURE is not None:
-        kwargs["temperature"] = TEMPERATURE
+    current_max_tokens = MAX_TOKENS
 
-    last_error = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = client.chat.completions.create(**kwargs)
-            return response.choices[0].message.content
-        except (APIConnectionError, APITimeoutError, InternalServerError) as e:
-            last_error = e
-            if attempt < MAX_RETRIES:
-                wait = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                print(f"  Network error ({type(e).__name__}), "
-                      f"retrying in {wait}s (attempt {attempt}/{MAX_RETRIES}) ...")
-                time.sleep(wait)
-            else:
-                print(f"  Giving up after {MAX_RETRIES} attempts: {e}")
+    while True:
+        kwargs = dict(
+            model=model,
+            messages=[
+                {"role": "user", "content": prompt_text}
+            ],
+            max_tokens=current_max_tokens,
+        )
+        if TEMPERATURE is not None:
+            kwargs["temperature"] = TEMPERATURE
 
-    raise last_error
+        last_error = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = client.chat.completions.create(**kwargs)
+                choice = response.choices[0]
+                truncated = choice.finish_reason == "length"
+
+                if truncated and current_max_tokens < MAX_TOKENS_CEILING:
+                    next_max_tokens = min(current_max_tokens * 2, MAX_TOKENS_CEILING)
+                    print(f"  Truncated at max_tokens={current_max_tokens}, "
+                          f"retrying this pair with max_tokens={next_max_tokens} ...")
+                    current_max_tokens = next_max_tokens
+                    break  # exit the network-retry loop, re-enter the while loop with a bigger budget
+
+                if truncated:
+                    # Already at the ceiling and still truncated — give up
+                    # escalating and return what we have, clearly flagged.
+                    print(f"  WARNING: still truncated at MAX_TOKENS_CEILING="
+                          f"{MAX_TOKENS_CEILING}. Later questions/factors for "
+                          f"this pair will be blank. Raise MAX_TOKENS_CEILING "
+                          f"if this happens often.")
+
+                return choice.message.content, truncated
+
+            except (APIConnectionError, APITimeoutError, InternalServerError) as e:
+                last_error = e
+                if attempt < MAX_RETRIES:
+                    wait = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                    print(f"  Network error ({type(e).__name__}), "
+                          f"retrying in {wait}s (attempt {attempt}/{MAX_RETRIES}) ...")
+                    time.sleep(wait)
+                else:
+                    print(f"  Giving up after {MAX_RETRIES} attempts: {e}")
+                    raise last_error
 
 
 def parse_numeric_fields(raw_text):
     """
-    Best-effort parse of the numbered answers into a flat dict.
-    Falls back to leaving fields blank if the model's formatting varies —
-    the raw response text is included in the return value too, so
-    nothing is lost even if a field fails to parse.
+    Parses the model's numbered answers into a flat dict.
+
+    This works in two structural steps rather than one flat set of
+    regexes, which matters because models vary in how they label each
+    item — some write plain "7. 35", others write "**Item 7 (Hobbies
+    compatibility):** 35". A naive "search for '7.' anywhere in the
+    text" approach is unsafe: question 13's own factor list is numbered
+    1-6, so an unbounded search for "7." (etc.) can accidentally match
+    inside that list instead of the real item 7 — producing a WRONG
+    value, not just a missing one, which is worse.
+
+    Step 1: locate every item marker (in either format) and its
+    position, keep only the first occurrence of each item number, and
+    use each marker's position as the boundary for where that item's
+    value must be found — never past the next marker. This makes the
+    parse immune to numbers that appear later in the response (like
+    question 13's list) leaking backward into earlier items.
+
+    Step 2: item 13's marker position is used as the split point between
+    "the 12 scored items" and "the factors list" — so factor items 1-6
+    are parsed completely separately.
     """
     fields = {}
-    patterns = {
-        "q1_realism": r"1\.\s*.*?([1-7])\b",
-        "q3_social_demo": r"3\..*?(\d{1,3})\b",
-        "q4_social_demo_conf": r"4\..*?(\d{1,3})\b",
-        "q5_psych": r"5\..*?(\d{1,3})\b",
-        "q6_psych_conf": r"6\..*?(\d{1,3})\b",
-        "q7_hobbies": r"7\..*?(\d{1,3})\b",
-        "q8_hobbies_conf": r"8\..*?(\d{1,3})\b",
-        "q9_expectations": r"9\..*?(\d{1,3})\b",
-        "q10_expectations_conf": r"10\..*?(\d{1,3})\b",
-        "q11_overall": r"11\..*?(\d{1,3})\b",
-        "q12_overall_conf": r"12\..*?(\d{1,3})\b",
-    }
-    for key, pat in patterns.items():
-        m = re.search(pat, raw_text, re.DOTALL)
-        fields[key] = m.group(1) if m else None
 
-    # Q2's answer format changed (options are now lettered a/b/c instead of
-    # numbered 1/2/3), and models phrase the answer inconsistently — so
-    # this is parsed separately, searching only within the bounded block
-    # of text between "2." and "3." (never spilling into later questions,
-    # which is what caused a real bug: an unbounded search here used to
-    # grab a stray digit from question 3's answer instead).
-    q2_block_match = re.search(r"2\.(.*?)(?=\n\s*3\.)", raw_text, re.DOTALL)
-    if q2_block_match:
-        q2_block = q2_block_match.group(1)
-        m = re.search(r"\b([1-3]|[a-cA-C])\b", q2_block)
-        fields["q2_construction"] = m.group(1) if m else None
-    else:
-        fields["q2_construction"] = None
+    # Matches either "Item N" (optionally bold, optionally followed by a
+    # parenthetical description and/or colon) or a plain "N." at the
+    # start of a line. Both forms are supported because different models
+    # (and even the same model across pairs) phrase this differently.
+    item_marker_re = re.compile(
+        r"(?:\*{0,2}\s*Item\s+(?P<n1>\d{1,2})\b(?:\s*\([^)]{0,100}\))?\s*:?\s*\*{0,2}"
+        r"|(?:^|\n)\s*\**\s*(?P<n2>\d{1,2})\.(?!\d))",
+        re.IGNORECASE
+    )
+
+    raw_markers = []
+    for m in item_marker_re.finditer(raw_text):
+        n = m.group("n1") or m.group("n2")
+        if n is not None:
+            raw_markers.append((int(n), m.start(), m.end()))
+
+    # Keep only the first occurrence of each item number, in the order
+    # they appear — this is what prevents e.g. question 13's internal
+    # "1. ..." factor list from being mistaken for item 1's own marker,
+    # since the real item 1 marker (whichever format) always appears
+    # earlier in the response.
+    seen = set()
+    markers = []
+    for num, start, end in raw_markers:
+        if num not in seen:
+            seen.add(num)
+            markers.append((num, start, end))
+
+    marker_by_num = {num: (start, end) for num, start, end in markers}
+
+    def value_window(item_num):
+        """
+        The text this item's value must be found in: from just after
+        this item's own marker, up to the start of whichever marker
+        comes next in the response (of any item number) — never
+        further. Returns "" if this item's marker wasn't found at all.
+        """
+        if item_num not in marker_by_num:
+            return ""
+        _, label_end = marker_by_num[item_num]
+        later_starts = [start for num, start, _ in markers if start > label_end]
+        window_end = min(later_starts) if later_starts else len(raw_text)
+        return raw_text[label_end:window_end]
+
+    def extract_value(item_num):
+        window = value_window(item_num)
+        if not window:
+            return None
+        if item_num == 1:
+            m = re.search(r"\b([1-7])\b", window)
+        elif item_num == 2:
+            m = re.search(r"\b([1-3]|[a-cA-C])\b", window)
+        else:
+            m = re.search(r"\b(\d{1,3})\b", window)
+        return m.group(1) if m else None
+
+    field_names = {
+        1: "q1_realism", 2: "q2_construction", 3: "q3_social_demo",
+        4: "q4_social_demo_conf", 5: "q5_psych", 6: "q6_psych_conf",
+        7: "q7_hobbies", 8: "q8_hobbies_conf", 9: "q9_expectations",
+        10: "q10_expectations_conf", 11: "q11_overall", 12: "q12_overall_conf",
+    }
+    for num, name in field_names.items():
+        fields[name] = extract_value(num)
 
     # Question 13 is free text: up to 6 ranked factors (a 6th "Other"
     # bucket is allowed), each with a direction (increased/decreased)
     # and a points value that should sum to 100 across all factors.
-    q13_match = re.search(r"13\.(.*)", raw_text, re.DOTALL)
-    q13_block = q13_match.group(1).strip() if q13_match else ""
+    # Its marker position (found above) is used as the split point, so
+    # this never overlaps with the items-1-12 parsing above.
+    if 13 in marker_by_num:
+        _, q13_start = marker_by_num[13]
+        q13_block = raw_text[q13_start:].strip()
+    else:
+        # Fallback for the rare case the marker-finder didn't catch a
+        # non-standard "13" label — same simple approach as before.
+        q13_match = re.search(r"13\.(.*)", raw_text, re.DOTALL)
+        q13_block = q13_match.group(1).strip() if q13_match else ""
 
     # Models often add a trailing summary after the numbered list (a
     # "Total: 100 points" line, a "---" divider, a closing note). None of
@@ -249,19 +357,28 @@ def parse_numeric_fields(raw_text):
 
     def clean_factor_description(factor_text):
         """
-        Strips the points phrase (e.g. "— 35 points", "(35 pts)") and
-        markdown bold markers out of the factor text, since the number
-        already lives in its own column — this keeps the description
-        column pure prose instead of duplicating "35 points" inline.
+        Strips the points phrase (e.g. "— 35 points", "(35 pts)",
+        "Points: 35") and markdown bold markers out of the factor text,
+        since the number already lives in its own column — this keeps
+        the description column pure prose instead of duplicating the
+        points value inline.
         """
-        # Remove a "<dash/em-dash> NN points" or "(NN points)" chunk
+        # Remove a "<dash/em-dash> NN points" chunk
         text = re.sub(
             r"\s*[-—–]\s*\d{1,3}\s*(?:points?|pts?)\b",
             "", factor_text, flags=re.IGNORECASE
         )
+        # Remove a "(NN points)" parenthetical
         text = re.sub(
             r"\s*\(\d{1,3}\s*(?:points?|pts?)?\)\s*",
             " ", text, flags=re.IGNORECASE
+        )
+        # Remove a trailing "Points: NN" or "Point value: NN" label
+        # (allowing for markdown bold markers on either side, e.g.
+        # "**Points: 38**")
+        text = re.sub(
+            r"\s*\**\s*Points?(?:\s+value)?\s*:\s*\d{1,3}\s*\**\s*$",
+            "", text, flags=re.IGNORECASE
         )
         # Strip markdown bold/italic markers
         text = text.replace("**", "").replace("*", "")
@@ -287,6 +404,8 @@ def parse_numeric_fields(raw_text):
 # description itself.
 COLUMNS = [
     ("Pair", "pair_id"),
+    ("Truncated?", "truncated"),
+    ("Incomplete?", "incomplete"),
     ("Q1 Realism (1-7)", "q1_realism"),
     ("Q2 Construction (1-3)", "q2_construction"),
     ("Q3 Social/Demo Compat", "q3_social_demo"),
@@ -311,6 +430,7 @@ COLUMNS = [
     ("Q13 Factor 5 Points", "q13_factor_5_points"),
     ("Q13 Factor 6 (Other)", "q13_factor_6"),
     ("Q13 Factor 6 Points", "q13_factor_6_points"),
+    ("Raw Response", "raw_response"),
 ]
 
 
@@ -358,6 +478,9 @@ def build_workbook(rows):
             if key == "pair_id":
                 cell.font = pair_font
                 cell.alignment = center
+            elif key == "raw_response":
+                cell.font = cell_font
+                cell.alignment = wrap
             elif key.startswith("q13_factor") and key.endswith("_points"):
                 cell.font = cell_font
                 cell.alignment = center
@@ -373,14 +496,18 @@ def build_workbook(rows):
         if key == "pair_id":
             continue
         col_letter = get_column_letter(c)
-        if key.startswith("q13_factor") and key.endswith("_points"):
+        if key == "raw_response":
+            ws.column_dimensions[col_letter].width = 80
+        elif key.startswith("q13_factor") and key.endswith("_points"):
             ws.column_dimensions[col_letter].width = 12
         elif key.startswith("q13_factor"):
             ws.column_dimensions[col_letter].width = 32
+        elif key in ("truncated", "incomplete"):
+            ws.column_dimensions[col_letter].width = 11
         else:
             ws.column_dimensions[col_letter].width = 13
 
-    ws.freeze_panes = "B2"
+    ws.freeze_panes = "D2"
 
     # Print setup: fit to page width, landscape, repeat header row
     ws.page_setup.orientation = "landscape"
@@ -429,9 +556,28 @@ def main():
             try:
                 # Fresh, isolated call every time: new pair, new model, new
                 # messages list — nothing carried over from any other call.
-                raw_text = rate_one_pair(client, prompt_text, model=model)
+                raw_text, truncated = rate_one_pair(client, prompt_text, model=model)
                 parsed = parse_numeric_fields(raw_text)
-                row = {"pair_id": pair_id, **parsed}
+
+                # Distinguish two different failure modes that can both
+                # leave later columns blank:
+                #   - "Truncated?" = the model was cut off (finish_reason
+                #     == "length") — a token-budget problem, already
+                #     retried with more room by rate_one_pair.
+                #   - "Incomplete?" = the model finished normally
+                #     (finish_reason == "stop") but never answered later
+                #     questions anyway — NOT a token-budget problem, so
+                #     raising MAX_TOKENS won't fix this one. Check the Raw
+                #     Response column to see what the model actually said.
+                key_late_fields = ["q7_hobbies", "q9_expectations", "q11_overall", "q13_factor_1"]
+                incomplete = (not truncated) and all(parsed.get(k) is None for k in key_late_fields)
+
+                row = {
+                    "pair_id": pair_id,
+                    "truncated": "YES" if truncated else "",
+                    "incomplete": "YES" if incomplete else "",
+                    **parsed,
+                }
             except Exception as e:
                 # After MAX_RETRIES failed attempts (or a non-retryable
                 # error), don't crash the whole run — record the failure
