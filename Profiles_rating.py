@@ -63,7 +63,7 @@ load_dotenv()  # reads a .env file in the current directory into os.environ, if 
 # Every pair is rated once per model listed here — edit this list directly
 # to add, remove, or swap which models run.
 MODELS = [
-    "z-ai/glm-5.3"
+    "meta/muse-spark-1.2"
 ]
 
 # Temperature is intentionally NOT set on the API call — this leaves each
