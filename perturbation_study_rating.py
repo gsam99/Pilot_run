@@ -61,6 +61,8 @@ MODELS = [
     "anthropic/claude-opus-5",
     "openai/gpt-5.5",
     "google/gemini-2.5-flash",
+    "x-ai/grok-4.6",
+    "nvidia/nemotron-3-ultra-550b-a55b",
 ]
 
 TEMPERATURE = None  # left unset, same reasoning as Profiles_rating.py
@@ -248,6 +250,24 @@ def parse_response(raw_text):
 
     for s in range(1, NUM_SCENARIOS + 1):
         fields[f"s{s}"] = extract_value(("scenario", s), "scenario")
+
+    # Fallback for models that answer with a bare, unlabeled list of
+    # numbers (one per line, no "1.", "Item 1", or "S1" markers at all —
+    # observed from grok-4.6). The marker-based parse above finds nothing
+    # to anchor on in that case, so every field comes back None even
+    # though the answer is right there. If literally every field is
+    # still empty, and the response consists of exactly 3 + NUM_SCENARIOS
+    # standalone numeric lines (optionally wrapped in bold markers),
+    # assign them positionally in document order: items 1-3, then S1-S16.
+    all_keys = ["q1_realism", "q2_construction", "q3_compatibility"] + [f"s{s}" for s in range(1, NUM_SCENARIOS + 1)]
+    if all(fields.get(k) is None for k in all_keys):
+        bare_numbers = re.findall(r"^\s*\**\s*(\d{1,3})\s*\**\s*$", raw_text, re.MULTILINE)
+        if len(bare_numbers) == 3 + NUM_SCENARIOS:
+            fields["q1_realism"] = bare_numbers[0]
+            fields["q2_construction"] = bare_numbers[1]
+            fields["q3_compatibility"] = bare_numbers[2]
+            for i, s in enumerate(range(1, NUM_SCENARIOS + 1)):
+                fields[f"s{s}"] = bare_numbers[3 + i]
 
     fields["raw_response"] = raw_text
     return fields
